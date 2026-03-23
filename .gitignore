@@ -1,0 +1,16 @@
+# Токен бота — не коммитить
+config.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# IDE / ОС
+.env
+.DS_Store
+Thumbs.db
