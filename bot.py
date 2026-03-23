@@ -16,11 +16,28 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from report_parser import parse_excel_report, format_report
 
 
-# Токен бота: из config.py, переменной REPORT_BOT_TOKEN или укажите здесь
-try:
-    from config import BOT_TOKEN
-except ImportError:
-    BOT_TOKEN = os.environ.get('REPORT_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+def _load_bot_token() -> str | None:
+    """
+    Токен (по приоритету):
+    1) Переменные окружения — удобно на хостинге (config.py в Git не кладём).
+       Имена: REPORT_BOT_TOKEN, BOT_TOKEN, TELEGRAM_BOT_TOKEN
+    2) Локальный файл config.py (копия из config.example.py)
+    """
+    for env_name in ('REPORT_BOT_TOKEN', 'BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'):
+        val = os.environ.get(env_name, '').strip()
+        if val:
+            return val
+    try:
+        from config import BOT_TOKEN as cfg_token
+        t = (cfg_token or '').strip()
+        if t and t != 'YOUR_BOT_TOKEN_HERE':
+            return t
+    except ImportError:
+        pass
+    return None
+
+
+BOT_TOKEN = _load_bot_token() or 'YOUR_BOT_TOKEN_HERE'
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -99,12 +116,14 @@ def main() -> None:
 
     if BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
         print("=" * 50)
-        print("ВНИМАНИЕ: Установите токен бота!")
-        print("1. Создайте бота через @BotFather в Telegram")
-        print("2. Задайте переменную окружения REPORT_BOT_TOKEN")
-        print("   или измените BOT_TOKEN в файле bot.py")
+        print("ОШИБКА: не задан токен бота.")
+        print("На хостинге: Environment Variables / Secrets, добавьте одну из:")
+        print("  REPORT_BOT_TOKEN=<токен от @BotFather>")
+        print("  или BOT_TOKEN=<токен>")
+        print("  или TELEGRAM_BOT_TOKEN=<токен>")
+        print("Локально: скопируйте config.example.py -> config.py и укажите BOT_TOKEN.")
         print("=" * 50)
-        return
+        sys.exit(1)
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
