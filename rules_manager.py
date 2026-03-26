@@ -17,8 +17,9 @@ DEFAULT_RULES: Dict[str, Rule] = {
     # qty+sum categories (show "шт ... руб" in template)
     "ticket_unlimited": Rule(match_mode="any", keywords=["билет(безлимит)", "вход безлимит"]),
     "ticket_1hour": Rule(match_mode="any", keywords=["билет(1час)", "билет 1час"]),
-    "action_happy_hours": Rule(match_mode="any", keywords=["счастливые часы", "счастливые", "час"]),
-    "action_last_hour": Rule(match_mode="any", keywords=["последний час", "последний"]),
+    # Важно: не добавляем слишком общие слова типа "час" — иначе будет матчиться "3 часа" и т.п.
+    "action_happy_hours": Rule(match_mode="any", keywords=["счастливые часы"]),
+    "action_last_hour": Rule(match_mode="any", keywords=["последний час"]),
     # sum-only categories
     "aquagrim": Rule(match_mode="any", keywords=["аквагрим"]),
     "viar": Rule(match_mode="any", keywords=["viar"]),
@@ -76,6 +77,11 @@ def load_rules() -> Dict[str, Rule]:
         match_mode = str(node.get("match_mode", default_rule.match_mode))
         keywords = node.get("keywords") or default_rule.keywords
         kw_list = [str(x).strip().lower() for x in keywords if str(x).strip()]
+        # Миграция от ранних "слишком широких" дефолтов
+        if rule_key == "action_happy_hours" and "час" in kw_list and len(kw_list) > 1:
+            kw_list = [k for k in kw_list if k != "час"]
+        if rule_key == "action_last_hour" and "последний" in kw_list and len(kw_list) > 1:
+            kw_list = [k for k in kw_list if k != "последний"]
         out[rule_key] = Rule(match_mode=match_mode, keywords=kw_list)
     return out
 
