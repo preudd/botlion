@@ -25,6 +25,7 @@ from report_parser import parse_excel_report, format_report
 from rules_manager import UI_CATEGORIES, add_keyword, load_rules, remove_keyword
 
 STATE_PICK_CATEGORY, STATE_WAIT_KEYWORD, STATE_PICK_DELETE_CATEGORY, STATE_PICK_DELETE_KEYWORD = range(4)
+APP_BUILD = "rules-ui+rules-parser+prochee-v3"
 
 
 def _load_bot_token() -> str | None:
@@ -343,6 +344,15 @@ def main() -> None:
         allow_reentry=True,
     )
     app.add_handler(conv)
+
+    try:
+        rules = load_rules()
+        print(f"BUILD: {APP_BUILD}")
+        print("RULES: action_happy_hours =", rules["action_happy_hours"].keywords)
+        print("RULES: action_last_hour  =", rules["action_last_hour"].keywords)
+        print("RULES: advance_dr        =", rules["advance_dr"].keywords)
+    except Exception as e:
+        print("WARNING: failed to load rules at startup:", e)
 
     print("Бот запущен. Отправьте файл Excel для формирования отчёта.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
