@@ -1,34 +1,66 @@
 # -*- coding: utf-8 -*-
 """
 Парсер Excel файлов с экспортом чеков для формирования вечернего отчёта.
-Ключевые столбцы: I (8) - Тип операции, O (14) - Список позиций, P (15) - Итог, Q (16) - Способ оплаты
+Ключевые столбцы (в текущей логике): I (8) - Тип операции, O (14) - Список позиций,
+P (15) - Итог, Q (16) - Способ оплаты.
+
+Если pandas/openpyxl недоступны, используется минимальный встроенный xlsx-ридер.
 """
-import pandas as pd
 import re
 from datetime import datetime
 from collections import defaultdict
 
+try:
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover
+    pd = None  # type: ignore
+
+from xlsx_minireader import iter_sheet_rows
+from rules_manager import UI_CATEGORIES, load_rules, match_rule
+
 
 def parse_items(text):
     """Парсит содержимое столбца O - список позиций в формате [Name, qty, price, total, ...]"""
-    if pd.isna(text) or not str(text).strip():
+    if text is None:
+        return []
+    if pd is not None:
+        if pd.isna(text) or not str(text).strip():
+            return []
+    if not str(text).strip():
         return []
     items = []
-    parts = re.split(r'\],?\s*\[', str(text))
+    parts = re.split(r"\],?\s*\[", str(text))
     for p in parts:
         p = p.strip().strip('[]')
         if not p:
             continue
-        fields = [x.strip() for x in p.split(',')]
-        if len(fields) >= 4:
-            name = fields[0]
+        fields = [x.strip() for x in p.split(",")]
+        if len(fields) < 4:
+            continue
+
+        # Иногда в названии бывают запятые → ищем первый числовой токен как qty
+        qty_idx = None
+        for i in range(1, len(fields)):
             try:
-                qty = int(float(fields[1]))
-                price = float(fields[2])
-                total = float(fields[3])
-                items.append({'name': name, 'qty': qty, 'price': price, 'total': total})
+                float(fields[i])
+                qty_idx = i
+                break
             except (ValueError, TypeError):
-                pass
+                continue
+        if qty_idx is None or qty_idx + 2 >= len(fields):
+            continue
+
+        name = ", ".join([f for f in fields[:qty_idx] if f]).strip()
+        try:
+            qty = int(float(fields[qty_idx]))
+            price = float(fields[qty_idx + 1])
+            total = float(fields[qty_idx + 2])
+        except (ValueError, TypeError):
+            continue
+
+        if not name:
+            continue
+        items.append({"name": name, "qty": qty, "price": price, "total": total})
     return items
 
 
@@ -40,8 +72,11 @@ def _line_sum(item):
 
 
 def _parse_date(val):
-    if pd.isna(val):
+    if val is None:
         return None
+    if pd is not None:
+        if pd.isna(val):
+            return None
     if isinstance(val, datetime):
         return val
     s = str(val).strip()
@@ -99,13 +134,26 @@ def _combo_all_split(unit_price, qty, is_weekend_row):
 
 def parse_excel_report(file_path):
     """Парсит Excel файл и формирует данные для отчёта."""
-    df = pd.read_excel(file_path)
+    if pd is not None:
+        df = pd.read_excel(file_path)
+        rows_iter = df.iterrows()
+        get_cell = lambda row, idx: row.iloc[idx]  # noqa: E731
+    else:
+        sheet_rows = list(iter_sheet_rows(file_path))
+        # предполагаем: первая строка — заголовки, дальше данные
+        data_rows = sheet_rows[1:] if sheet_rows else []
+        rows_iter = enumerate(data_rows)
+
+        def get_cell(row, idx):  # type: ignore
+            return row[idx] if idx < len(row) else None
 
     COL_DATE = 5
     COL_OPERATION = 8
     COL_ITEMS = 14
     COL_TOTAL = 15
     COL_PAYMENT = 16
+
+    rules = load_rules()
 
     revenue_total = 0
     terminal_total = 0
@@ -114,6 +162,7 @@ def parse_excel_report(file_path):
 
     category_qty = defaultdict(int)
     category_sum = defaultdict(float)
+    prochee_detail = defaultdict(lambda: {"qty": 0, "sum": 0.0})
 
     combo_ag_qty = 0
     combo_ag_entry = 0
@@ -130,14 +179,19 @@ def parse_excel_report(file_path):
     advance_dr = 0
     rent = 0
     advance_graduation = 0
+    advance_animator = 0.0
 
-    # Позиции, не попавшие в основные категории (наименование как в чеке)
-    prochee_detail = defaultdict(lambda: {'qty': 0, 'sum': 0.0})
+    for idx, row in rows_iter:
+        op_raw = get_cell(row, COL_OPERATION)
+        total_raw = get_cell(row, COL_TOTAL)
+        pay_raw = get_cell(row, COL_PAYMENT)
 
-    for idx, row in df.iterrows():
-        op_type = str(row.iloc[COL_OPERATION]).strip() if pd.notna(row.iloc[COL_OPERATION]) else ''
-        total = float(row.iloc[COL_TOTAL]) if pd.notna(row.iloc[COL_TOTAL]) else 0
-        payment = str(row.iloc[COL_PAYMENT]).strip() if pd.notna(row.iloc[COL_PAYMENT]) else ''
+        op_type = str(op_raw).strip() if op_raw is not None else ""
+        try:
+            total = float(total_raw) if total_raw is not None and str(total_raw).strip() != "" else 0.0
+        except (TypeError, ValueError):
+            total = 0.0
+        payment = str(pay_raw).strip() if pay_raw is not None else ""
 
         if op_type == 'Возврат прихода':
             return_total += total
@@ -154,9 +208,9 @@ def parse_excel_report(file_path):
         elif 'налич' in payment.lower():
             cash_total += total
 
-        row_date = row.iloc[COL_DATE]
+        row_date = get_cell(row, COL_DATE)
         weekend = _is_weekend(row_date)
-        items = parse_items(row.iloc[COL_ITEMS])
+        items = parse_items(get_cell(row, COL_ITEMS))
 
         for item in items:
             name = str(item['name']).strip()
@@ -204,63 +258,65 @@ def parse_excel_report(file_path):
                 continue
 
             # --- Вход безлимит: только Билет(БЕЗЛИМИТ), любая цена ---
-            if 'билет(безлимит)' in nl or 'вход безлимит' in nl:
+            if match_rule(nl, rules["ticket_unlimited"]):
                 category_qty['Вход безлимит'] += qty
                 category_sum['Вход безлимит'] += ls
                 continue
 
             # --- Билет 1 час ---
-            if 'билет(1час)' in nl or 'билет 1час' in nl:
+            if match_rule(nl, rules["ticket_1hour"]):
                 category_qty['Билет 1час'] += qty
                 category_sum['Билет 1час'] += ls
                 continue
 
-            # --- Акции: только 500 ₽ ---
-            if abs(float(price) - 500) < 0.01:
-                if 'счастливые' in nl and 'час' in nl:
-                    category_qty['Акция счастливые часы'] += qty
-                    category_sum['Акция счастливые часы'] += ls
-                    continue
-                if 'последний' in nl and 'час' in nl:
-                    category_qty['Акция последний час'] += qty
-                    category_sum['Акция последний час'] += ls
-                    continue
+            # --- Акции: по названию (без привязки к цене) ---
+            if match_rule(nl, rules["action_happy_hours"]):
+                category_qty['Акция счастливые часы'] += qty
+                category_sum['Акция счастливые часы'] += ls
+                continue
+            if match_rule(nl, rules["action_last_hour"]):
+                category_qty['Акция последний час'] += qty
+                category_sum['Акция последний час'] += ls
+                continue
 
             # --- Аквагрим: только отдельная позиция, не комбо ---
-            if nl == 'аквагрим' or (nl.startswith('аквагрим') and 'комбо' not in nl):
+            if match_rule(nl, rules["aquagrim"]) and 'комбо' not in nl:
                 category_sum['Аквагрим'] += ls
                 continue
 
             # --- Viar: только отдельная позиция ---
-            if nl == 'viar' or (nl.startswith('viar') and 'комбо' not in nl):
+            if match_rule(nl, rules["viar"]) and 'комбо' not in nl:
                 category_sum['Виар'] += ls
                 continue
 
             # --- Шары: только «Шар» (и опечатка Щар) ---
-            if nl in ('шар', 'щар'):
+            if match_rule(nl, rules["balls"]):
                 category_sum['Шары'] += ls
                 continue
 
             # --- Сопровождающий: только явное название ---
-            if 'сопровождающ' in nl:
+            if match_rule(nl, rules["accompany"]):
                 category_sum['Сопровождающий'] += ls
                 continue
 
             # --- Прочие из маппинга ---
-            if 'аванс др' in nl or 'аванс день рождения' in nl:
+            if match_rule(nl, rules["advance_animator"]):
+                advance_animator += ls
+                continue
+            if match_rule(nl, rules["advance_dr"]):
                 advance_dr += ls
                 continue
-            if 'аренда комнаты' in nl:
+            if match_rule(nl, rules["rent_room"]):
                 rent += ls
                 continue
-            if 'аванс выпускной' in nl:
+            if match_rule(nl, rules["advance_graduation"]):
                 advance_graduation += ls
                 continue
 
             category_qty['Прочее'] += qty
             category_sum['Прочее'] += ls
-            prochee_detail[name]['qty'] += qty
-            prochee_detail[name]['sum'] += ls
+            prochee_detail[name]["qty"] += qty
+            prochee_detail[name]["sum"] += ls
 
     return {
         'revenue': revenue_total,
@@ -276,21 +332,21 @@ def parse_excel_report(file_path):
         'advance_dr': advance_dr,
         'rent': rent,
         'advance_graduation': advance_graduation,
-        'prochee_detail': {k: dict(v) for k, v in prochee_detail.items()},
+        'advance_animator': advance_animator,
+        "prochee_detail": {k: dict(v) for k, v in prochee_detail.items()},
     }
 
 
-def _format_prochee_block(data, rub_fn):
-    """Текст блока «Прочее» с разбивкой по наименованиям."""
-    detail = data.get('prochee_detail') or {}
+def _format_prochee_block(data, rub_fn) -> str:
+    detail = data.get("prochee_detail") or {}
     if not detail:
         return "Прочее: позиций нет."
     lines = ["Прочее (не вошло в основные категории):"]
     total = 0.0
     for name in sorted(detail.keys(), key=str.lower):
         d = detail[name]
-        q = int(d['qty'])
-        s = float(d['sum'])
+        q = int(d.get("qty") or 0)
+        s = float(d.get("sum") or 0.0)
         total += s
         lines.append(f"• {name} — {q} шт {rub_fn(s)} руб")
     lines.append(f"Итого прочее: {rub_fn(total)} руб")
@@ -304,6 +360,43 @@ def format_report(data, report_date=None):
 
     def rub(val):
         return f'{val:,.0f}'.replace(',', ' ') if isinstance(val, (int, float)) else '0'
+
+    def qty_sum_line(label: str, qty_val, sum_val):
+        q = int(qty_val or 0)
+        s = float(sum_val or 0)
+        if q <= 0 or abs(s) < 0.000001:
+            return f"{label} – 0"
+        return f"{label} – {q} шт {rub(s)}  руб"
+
+    def qty_sum_line_nozeroqty(label: str, qty_val, sum_val):
+        """Для 'Вход безлимит' (в примере всегда с 'шт ... руб')."""
+        q = int(qty_val or 0)
+        s = float(sum_val or 0)
+        return f"{label} - {q} шт {rub(s)}  руб"
+
+    def qty_sum_line_actions(label: str, qty_val, sum_val):
+        """Для акций: как '1шт 500 руб', иначе '0'."""
+        q = int(qty_val or 0)
+        s = float(sum_val or 0)
+        if q <= 0 or abs(s) < 0.000001:
+            return f"{label} 0"
+        return f"{label} - {q}шт {rub(s)} руб"
+
+    def money_line(label: str, sum_val, *, dash_if_zero: bool = False, suffix: str = "руб"):
+        try:
+            s = float(sum_val or 0)
+        except (TypeError, ValueError):
+            s = 0.0
+        if abs(s) < 0.000001 and dash_if_zero:
+            return f"{label} -"
+        return f"{label} - {rub(s)} {suffix}".rstrip()
+
+    def combo_money(val):
+        try:
+            v = float(val or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        return "" if abs(v) < 0.000001 else rub(v)
 
     cq = data['category_qty']
     cs = data['category_sum']
@@ -322,37 +415,37 @@ def format_report(data, report_date=None):
 
 Количество чеков - {data['receipt_count']} шт. 
 
-Вход безлимит - {cq.get('Вход безлимит', 0)} шт {rub(cs.get('Вход безлимит', 0))} руб
-Билет 1час – {cq.get('Билет 1час', 0)} шт {rub(cs.get('Билет 1час', 0))} руб
-Акция счастливые часы - {cq.get('Акция счастливые часы', 0)} шт {rub(cs.get('Акция счастливые часы', 0))} руб 
-Акция последний час - {cq.get('Акция последний час', 0)} шт {rub(cs.get('Акция последний час', 0))} руб
+{qty_sum_line_nozeroqty("Вход безлимит", cq.get('Вход безлимит', 0), cs.get('Вход безлимит', 0))}
+{qty_sum_line("Билет 1час", cq.get('Билет 1час', 0), cs.get('Билет 1час', 0))}
+{qty_sum_line_actions("Акция счастливые часы", cq.get('Акция счастливые часы', 0), cs.get('Акция счастливые часы', 0))}
+{qty_sum_line_actions("Акция последний час", cq.get('Акция последний час', 0), cs.get('Акция последний час', 0))}
 
-Аквагрим - {rub(cs.get('Аквагрим', 0))} руб
-Виар - {rub(cs.get('Виар', 0))} руб
-Шары - {rub(cs.get('Шары', 0))} руб
-Сопровождающий - {rub(cs.get('Сопровождающий', 0))} руб
+{money_line("Аквагрим", cs.get('Аквагрим', 0))}
+Виар - {rub(cs.get('Виар', 0))}
+{money_line("Шары", cs.get('Шары', 0), suffix="руб")}
+{money_line("Сопровождающий", cs.get('Сопровождающий', 0), suffix="руб")}
 
 {prochee_block}
 
 Комбо(Билет+Аквагрим): {int(ca[0])}шт 
-Вход – {rub(ca[1])}
-Аквагрим – {rub(ca[2])}
+Вход – {combo_money(ca[1])}
+Аквагрим – {combo_money(ca[2])}
 
 Комбо(Билет+VR): {int(cv[0])} шт 
-Вход – {rub(cv[1])}
-VR – {rub(cv[2])}
+Вход – {combo_money(cv[1])}
+VR – {combo_money(cv[2])}
 
 Комбо все включено : {int(call[0])} шт
-Вход - {rub(call[1])}
-Аквагрим - {rub(call[2])}
-VR - {rub(call[3])}
+Вход - {combo_money(call[1])}
+Аквагрим - {combo_money(call[2])}
+VR - {combo_money(call[3])}
 
 Возврат - {rub(data['return_total'])}
 
 Аванс ДР - {rub(data['advance_dr'])}
-Аренда комнаты - {rub(data['rent'])}
+Аренда комнаты - {rub(data['rent'])} 
 Аванс выпускной - {rub(data['advance_graduation'])}
-Комбо на ДР 3 часа - {cq.get('Комбо на ДР 3 часа', 0)} шт {rub(cs.get('Комбо на ДР 3 часа', 0))}
+Комбо на ДР 3 часа - {rub(cs.get('Комбо на ДР 3 часа', 0))}
 
 Касса: 
 Инкассация: 

@@ -1,5 +1,6 @@
 # Токен бота — не коммитить
 config.py
+category_rules.json
 
 # Python
 __pycache__/
