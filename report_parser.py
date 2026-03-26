@@ -47,15 +47,49 @@ def parse_items(text):
                 break
             except (ValueError, TypeError):
                 continue
-        if qty_idx is None or qty_idx + 2 >= len(fields):
+        if qty_idx is None:
             continue
 
         name = ", ".join([f for f in fields[:qty_idx] if f]).strip()
         try:
             qty = int(float(fields[qty_idx]))
-            price = float(fields[qty_idx + 1])
-            total = float(fields[qty_idx + 2])
         except (ValueError, TypeError):
+            continue
+
+        # Дальше в выгрузках встречаются варианты:
+        # [name, qty, price, total, ...]
+        # [name, qty, "", total, ...]  (цена пустая, есть только сумма)
+        money_nums: list[float] = []
+        nums: list[float] = []
+        for s in fields[qty_idx + 1 :]:
+            if s == "":
+                continue
+            raw = str(s).strip()
+            if not raw:
+                continue
+            # "денежные" значения обычно с десятичной частью (например 500.00)
+            if re.fullmatch(r"\d+[.,]\d+", raw):
+                try:
+                    money_nums.append(float(raw.replace(",", ".")))
+                except ValueError:
+                    pass
+                continue
+            try:
+                nums.append(float(raw))
+            except (ValueError, TypeError):
+                continue
+
+        if len(money_nums) >= 2:
+            price, total = money_nums[0], money_nums[1]
+        elif len(money_nums) == 1:
+            total = money_nums[0]
+            price = (total / qty) if qty else 0.0
+        elif len(nums) >= 2:
+            price, total = nums[0], nums[1]
+        elif len(nums) == 1:
+            total = nums[0]
+            price = (total / qty) if qty else 0.0
+        else:
             continue
 
         if not name:
