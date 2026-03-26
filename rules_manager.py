@@ -72,17 +72,35 @@ def load_rules() -> Dict[str, Rule]:
 
     raw: Dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     out: Dict[str, Rule] = {}
+    changed = False
     for rule_key, default_rule in DEFAULT_RULES.items():
         node = raw.get(rule_key) or {}
         match_mode = str(node.get("match_mode", default_rule.match_mode))
         keywords = node.get("keywords") or default_rule.keywords
         kw_list = [str(x).strip().lower() for x in keywords if str(x).strip()]
         # Миграция от ранних "слишком широких" дефолтов
-        if rule_key == "action_happy_hours" and "час" in kw_list and len(kw_list) > 1:
-            kw_list = [k for k in kw_list if k != "час"]
-        if rule_key == "action_last_hour" and "последний" in kw_list and len(kw_list) > 1:
+        if rule_key == "action_happy_hours":
+            before = list(kw_list)
+            # убираем слишком общие ключевые слова прошлых версий
+            kw_list = [k for k in kw_list if k not in ("час", "счастливые")]
+            if not kw_list:
+                kw_list = list(DEFAULT_RULES[rule_key].keywords)
+            if kw_list != before:
+                changed = True
+
+        if rule_key == "action_last_hour":
+            before = list(kw_list)
             kw_list = [k for k in kw_list if k != "последний"]
+            if not kw_list:
+                kw_list = list(DEFAULT_RULES[rule_key].keywords)
+            if kw_list != before:
+                changed = True
+
         out[rule_key] = Rule(match_mode=match_mode, keywords=kw_list)
+
+    # Если применили миграцию — сохраняем обратно, чтобы эффект был сразу на хостинге.
+    if changed:
+        save_rules(out)
     return out
 
 
