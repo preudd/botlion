@@ -80,15 +80,18 @@ def parse_items(text):
                 continue
 
         if len(money_nums) >= 2:
+            # классический формат: [qty, price, total]
             price, total = money_nums[0], money_nums[1]
         elif len(money_nums) == 1:
-            total = money_nums[0]
-            price = (total / qty) if qty else 0.0
+            # в ряде выгрузок есть только одно денежное значение после qty:
+            # оно является ценой за единицу (unit price)
+            price = money_nums[0]
+            total = price * qty
         elif len(nums) >= 2:
             price, total = nums[0], nums[1]
         elif len(nums) == 1:
-            total = nums[0]
-            price = (total / qty) if qty else 0.0
+            price = nums[0]
+            total = price * qty
         else:
             continue
 
