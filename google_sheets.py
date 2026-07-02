@@ -1,0 +1,337 @@
+# -*- coding: utf-8 -*-
+"""
+Подключение к Google Таблице и запись вечернего отчёта.
+Таблица и листы месяцев должны уже существовать — бот их не создаёт.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from datetime import datetime
+from typing import Any
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:  # pragma: no cover
+    gspread = None  # type: ignore
+    Credentials = None  # type: ignore
+
+SCOPES = ("https://www.googleapis.com/auth/spreadsheets",)
+
+MONTH_SHEET_NAMES = {
+    1: "январь",
+    2: "февраль",
+    3: "март",
+    4: "апрель",
+    5: "май",
+    6: "июнь",
+    7: "июль",
+    8: "август",
+    9: "сентябрь",
+    10: "октябрь",
+    11: "ноябрь",
+    12: "декабрь",
+}
+
+# Пока лист не переименован (например, «Лист1» вместо «июль»)
+MONTH_SHEET_ALIASES: dict[int, list[str]] = {
+    7: ["Лист1", "лист1"],
+}
+
+EMPLOYEES: dict[str, dict[str, Any]] = {
+    "alina": {
+        "label": "Алина",
+        "date_col": 23,  # W
+        "values_start_col": 24,  # X (Выручка) .. AI (Расчет др); AJ-AL — касса
+    },
+    "ilya": {
+        "label": "Илья",
+        "date_col": 40,  # AN
+        "values_start_col": 41,  # AO .. AZ; BA-BC — касса
+    },
+    "kira": {
+        "label": "Кира",
+        "date_col": 58,  # BF
+        "values_start_col": 59,  # BG .. BR; BS-BU — касса
+    },
+}
+
+# W/X..AI, AN/AO..AZ, BF/BG..BR — 12 полей из Excel, без кассовых колонок
+VALUES_COUNT = 12
+
+
+def _load_setting(name: str, default: str = "") -> str:
+    val = os.environ.get(name, "").strip()
+    if val:
+        return val
+    try:
+        import config  # type: ignore
+
+        return str(getattr(config, name, default) or "").strip()
+    except ImportError:
+        return default
+
+
+def is_configured() -> bool:
+    spreadsheet_id = _load_setting("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        return False
+    if _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        return True
+    file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    return bool(file_path and os.path.isfile(file_path))
+
+
+def _load_credentials():
+    if Credentials is None or gspread is None:
+        raise RuntimeError(
+            "Не установлены библиотеки для Google Sheets. Выполните: pip install -r requirements.txt"
+        )
+
+    json_raw = _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if json_raw:
+        info = json.loads(json_raw)
+        return Credentials.from_service_account_info(info, scopes=SCOPES)
+
+    file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    if not file_path or not os.path.isfile(file_path):
+        raise RuntimeError(
+            "Не задан доступ к Google Sheets. Укажите GOOGLE_SERVICE_ACCOUNT_FILE "
+            "или переменную окружения GOOGLE_SERVICE_ACCOUNT_JSON."
+        )
+    return Credentials.from_service_account_file(file_path, scopes=SCOPES)
+
+
+def get_service_account_email() -> str | None:
+    json_raw = _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if json_raw:
+        try:
+            return json.loads(json_raw).get("client_email")
+        except json.JSONDecodeError:
+            return None
+
+    file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    if file_path and os.path.isfile(file_path):
+        try:
+            with open(file_path, encoding="utf-8") as fh:
+                return json.load(fh).get("client_email")
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def get_client():
+    return gspread.authorize(_load_credentials())
+
+
+def get_spreadsheet():
+    spreadsheet_id = _load_setting("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("Не задан GOOGLE_SPREADSHEET_ID.")
+    return get_client().open_by_key(spreadsheet_id)
+
+
+def get_employee_label(employee_key: str) -> str:
+    emp = EMPLOYEES.get(employee_key)
+    if not emp:
+        raise ValueError(f"Неизвестный сотрудник: {employee_key}")
+    return str(emp["label"])
+
+
+def spreadsheet_url() -> str | None:
+    spreadsheet_id = _load_setting("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        return None
+    custom = _load_setting("GOOGLE_SPREADSHEET_URL")
+    if custom:
+        return custom
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+
+
+def _parse_report_date(report_date: str) -> tuple[int, int, int]:
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            dt = datetime.strptime(report_date.strip(), fmt)
+            year = dt.year if dt.year >= 2000 else dt.year + 2000
+            return dt.day, dt.month, year
+        except ValueError:
+            continue
+    raise ValueError(f"Неверный формат даты отчёта: {report_date}")
+
+
+def _month_sheet_name(month: int) -> str:
+    return MONTH_SHEET_NAMES[month]
+
+
+def _resolve_month_worksheet(spreadsheet, month: int):
+    expected = _month_sheet_name(month)
+    worksheets = spreadsheet.worksheets()
+    by_title = {ws.title.strip().lower(): ws for ws in worksheets}
+
+    for candidate in (expected, expected.capitalize(), f"{month:02d}", str(month)):
+        ws = by_title.get(candidate.lower())
+        if ws:
+            return ws
+
+    for alias in MONTH_SHEET_ALIASES.get(month, []):
+        ws = by_title.get(alias.lower())
+        if ws:
+            return ws
+
+    # Фоллбек: поддержка названий вида "отчет июль", "июль 2026", и т.п.
+    expected_l = expected.lower()
+    report_like = [
+        ws
+        for ws in worksheets
+        if expected_l in ws.title.strip().lower() and "отчет" in ws.title.strip().lower()
+    ]
+    if report_like:
+        return report_like[0]
+
+    contains_month = [ws for ws in worksheets if expected_l in ws.title.strip().lower()]
+    if contains_month:
+        return contains_month[0]
+
+    available = ", ".join(ws.title for ws in worksheets) or "нет"
+    raise RuntimeError(
+        f"Лист месяца «{expected}» не найден. Доступные листы: {available}"
+    )
+
+
+def get_worksheet_for_date(report_date: str):
+    _day, month, _year = _parse_report_date(report_date)
+    return _resolve_month_worksheet(get_spreadsheet(), month)
+
+
+def test_connection() -> dict[str, Any]:
+    spreadsheet = get_spreadsheet()
+    worksheets = spreadsheet.worksheets()
+    preview_sheet = worksheets[0] if worksheets else None
+
+    return {
+        "spreadsheet_title": spreadsheet.title,
+        "spreadsheet_id": spreadsheet.id,
+        "sheet_name": preview_sheet.title if preview_sheet else "—",
+        "sheet_count": len(worksheets),
+        "sheet_names": [ws.title for ws in worksheets],
+        "service_account_email": get_service_account_email(),
+        "url": spreadsheet_url(),
+        "employees": [emp["label"] for emp in EMPLOYEES.values()],
+    }
+
+
+def _num(value: Any) -> int | float:
+    if value is None:
+        return 0
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if abs(num - round(num)) < 0.000001:
+        return int(round(num))
+    return num
+
+
+def build_employee_values(data: dict) -> list[int | float]:
+    cs = data.get("category_sum") or {}
+    return [
+        _num(data.get("revenue")),
+        _num(data.get("terminal")),
+        _num(data.get("cash")),
+        _num(data.get("receipt_count")),
+        _num(cs.get("Билет 1час")),
+        _num(cs.get("Вход безлимит")),
+        _num(cs.get("Акция счастливые часы")),
+        _num(cs.get("Аквагрим")),
+        _num(cs.get("Шары")),
+        _num(cs.get("Виар")),
+        _num(data.get("advance_dr")),
+        _num(cs.get("Комбо на ДР 3 часа")),
+    ]
+
+
+def _col_letter(col: int) -> str:
+    result = ""
+    while col:
+        col, rem = divmod(col - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _normalize_day_label(value: str) -> str | None:
+    text = str(value or "").strip()
+    m = re.fullmatch(r"(\d{1,2})[./](\d{1,2})(?:[./]\d{2,4})?", text)
+    if not m:
+        return None
+    return f"{int(m.group(1)):02d}.{int(m.group(2)):02d}"
+
+
+def _find_day_row(worksheet, day: int, month: int) -> int:
+    target = f"{day:02d}.{month:02d}"
+    dates_col = worksheet.col_values(1)
+    for row_idx, cell in enumerate(dates_col, start=1):
+        if row_idx < 3:
+            continue
+        if _normalize_day_label(cell) == target:
+            return row_idx
+    raise RuntimeError(f"Строка для даты {target} не найдена на листе «{worksheet.title}».")
+
+
+def write_report(data: dict, report_date: str, employee_key: str) -> dict[str, Any]:
+    if not is_configured():
+        raise RuntimeError(
+            "Google Таблица не настроена. Задайте GOOGLE_SPREADSHEET_ID и ключ сервисного аккаунта."
+        )
+
+    emp = EMPLOYEES.get(employee_key)
+    if not emp:
+        raise ValueError(f"Неизвестный сотрудник: {employee_key}")
+
+    day, month, year = _parse_report_date(report_date)
+    worksheet = _resolve_month_worksheet(get_spreadsheet(), month)
+    row = _find_day_row(worksheet, day, month)
+    values = build_employee_values(data)
+
+    if len(values) != VALUES_COUNT:
+        raise RuntimeError("Внутренняя ошибка: неверное число полей для записи.")
+
+    updates: list[dict[str, Any]] = []
+
+    date_col = int(emp["date_col"])
+    start_col = int(emp["values_start_col"])
+    # Защитный барьер: не записывать ничего в левую часть таблицы (A-P).
+    if date_col <= 16 or start_col <= 16:
+        raise RuntimeError(
+            f"Неверный маппинг колонок для {emp['label']}: запись в A-P запрещена."
+        )
+
+    date_cell = f"{_col_letter(date_col)}{row}"
+    updates.append(
+        {
+            "range": date_cell,
+            "values": [[f"{day:02d}.{month:02d}.{year}"]],
+        }
+    )
+
+    end_col = start_col + VALUES_COUNT - 1
+    values_range = f"{_col_letter(start_col)}{row}:{_col_letter(end_col)}{row}"
+    updates.append({"range": values_range, "values": [values]})
+
+    worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+    return {
+        "action": "updated",
+        "date": report_date,
+        "day_label": f"{day:02d}.{month:02d}",
+        "employee": emp["label"],
+        "row": row,
+        "url": spreadsheet_url(),
+        "sheet_name": worksheet.title,
+        "spreadsheet_title": get_spreadsheet().title,
+        "message": (
+            f"Отчёт за {report_date} записан для {emp['label']} "
+            f"на лист «{worksheet.title}», строка {row}."
+        ),
+    }

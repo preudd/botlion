@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Телеграм-бот для формирования вечернего отчёта из Excel файла с экспортом чеков.
-Отправьте боту файл .xlsx - он вернёт готовый отчёт.
+Отправьте боту файл .xlsx — он обработает данные и запишет их в Google Таблицу.
 """
 import asyncio
 import os
@@ -21,11 +21,27 @@ from telegram.ext import (
     filters,
 )
 
-from report_parser import parse_excel_report, format_report
+from report_parser import parse_excel_report
 from rules_manager import UI_CATEGORIES, add_keyword, load_rules, remove_keyword
+from google_sheets import (
+    EMPLOYEES,
+    get_employee_label,
+    is_configured,
+    test_connection,
+    write_report,
+    get_service_account_email,
+)
 
 STATE_PICK_CATEGORY, STATE_WAIT_KEYWORD, STATE_PICK_DELETE_CATEGORY, STATE_PICK_DELETE_KEYWORD = range(4)
-APP_BUILD = "rules-ui+rules-parser+prochee-v3"
+APP_BUILD = "google-sheets-employees-v1"
+
+EMPLOYEE_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("Алина", callback_data="emp:alina")],
+        [InlineKeyboardButton("Илья", callback_data="emp:ilya")],
+        [InlineKeyboardButton("Кира", callback_data="emp:kira")],
+    ]
+)
 
 
 def _load_bot_token() -> str | None:
@@ -55,17 +71,110 @@ BOT_TOKEN = _load_bot_token() or 'YOUR_BOT_TOKEN_HERE'
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
     keyboard = [
+        [InlineKeyboardButton("Кому делаем отчёт?", callback_data="ui:pick_employee")],
         [InlineKeyboardButton("Добавить правило", callback_data="ui:add_rule")],
         [InlineKeyboardButton("Удалить правило", callback_data="ui:delete_rule")],
         [InlineKeyboardButton("Показать правила", callback_data="ui:show_rules")],
     ]
+    selected = context.user_data.get("employee")
+    selected_line = ""
+    if selected and selected in EMPLOYEES:
+        selected_line = f"\n\n👤 Сейчас выбрано: {get_employee_label(selected)}"
     await update.message.reply_text(
-        "Привет! Я бот для формирования вечернего отчёта.\n\n"
-        "📤 Отправь мне файл Excel (.xlsx) с экспортом чеков — я сформирую отчёт и отправлю его тебе.\n\n"
-        "Дата в отчёте будет взята из названия файла (например, 'Экспорт чеков от 17-01-2026.xlsx' → 17.01.2026), "
+        "Привет! Я бот для вечернего отчёта.\n\n"
+        "📤 Отправь мне файл Excel (.xlsx) с экспортом чеков — я обработаю его "
+        "и запишу данные в Google Таблицу.\n\n"
+        "👤 Перед отправкой файла можно выбрать сотрудника кнопкой "
+        "«Кому делаем отчёт?» — или выбрать после загрузки файла.\n\n"
+        "📊 Команда /sheets — проверить подключение к таблице.\n\n"
+        "Дата в отчёте берётся из названия файла (например, "
+        "'Экспорт чеков от 17-01-2026.xlsx' → 17.01.2026), "
         "или сегодняшняя, если дату не удастся определить."
-        , reply_markup=InlineKeyboardMarkup(keyboard)
+        f"{selected_line}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+def _format_money(value: float | int) -> str:
+    return f"{float(value):,.0f}".replace(",", " ")
+
+
+async def _send_report_result(
+    update: Update,
+    *,
+    data: dict,
+    report_date: str,
+    result: dict,
+) -> None:
+    message = update.callback_query.message if update.callback_query else update.message
+    if not message:
+        return
+    url = result.get("url") or "—"
+    returns = _format_money(data.get("return_total", 0))
+    revenue = _format_money(data.get("revenue", 0))
+    cash = _format_money(data.get("cash", 0))
+    copy_block = (
+        f"Дата {report_date}\n\n"
+        f"За сегодня:\n"
+        f"Выручка - {revenue} руб.\n"
+        f"Наличка приход - {cash} руб.\n"
+        f"Возвраты - {returns} руб.\n"
+        f"Аквагрим ДР - (внести вручную)"
+    )
+    await message.reply_text(
+        f"✅ Отчёт записан для: {result.get('employee')}\n\n"
+        f"<pre>{copy_block}</pre>\n\n"
+        f"Лист: {result.get('sheet_name')}, строка {result.get('row')}\n"
+        f"Ссылка: {url}",
+        parse_mode="HTML",
+    )
+
+
+async def _process_pending_report(update: Update, context: ContextTypes.DEFAULT_TYPE, employee_key: str) -> None:
+    pending = context.user_data.pop("pending_report", None)
+    if not pending:
+        label = get_employee_label(employee_key)
+        text = f"✅ Отчёты будут записываться для: {label}"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text)
+        elif update.message:
+            await update.message.reply_text(text)
+        return
+
+    data = pending["data"]
+    report_date = pending["report_date"]
+    result = write_report(data, report_date, employee_key)
+    await _send_report_result(update, data=data, report_date=report_date, result=result)
+
+
+async def ui_pick_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    await query.edit_message_text(
+        "Кому делаем отчёт?",
+        reply_markup=EMPLOYEE_KEYBOARD,
+    )
+
+
+async def ui_select_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    employee_key = (query.data or "").split(":", 1)[1] if query.data else ""
+    if employee_key not in EMPLOYEES:
+        await query.edit_message_text("Не удалось выбрать сотрудника. Попробуй ещё раз /start.")
+        return
+
+    context.user_data["employee"] = employee_key
+    if context.user_data.get("pending_report"):
+        await _process_pending_report(update, context, employee_key)
+    else:
+        await query.edit_message_text(
+            f"✅ Отчёты будут записываться для: {get_employee_label(employee_key)}"
+        )
 
 
 async def ui_add_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -259,6 +368,46 @@ def extract_date_from_filename(filename: str) -> str | None:
     return None
 
 
+async def cmd_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Проверка подключения к Google Таблице."""
+    if not is_configured():
+        email_hint = ""
+        sa_email = get_service_account_email()
+        if sa_email:
+            email_hint = f"\n\nСервисный аккаунт: `{sa_email}`"
+        await update.message.reply_text(
+            "⚠️ Google Таблица не настроена.\n\n"
+            "Нужно указать в `config.py` или переменных окружения:\n"
+            "• `GOOGLE_SPREADSHEET_ID`\n"
+            "• `GOOGLE_SERVICE_ACCOUNT_FILE` или `GOOGLE_SERVICE_ACCOUNT_JSON`\n\n"
+            "Листы месяцев (`январь`, `февраль`, …) должны уже существовать в таблице.\n"
+            "Таблицу нужно заранее расшарить на email сервисного аккаунта "
+            "(роль «Редактор»)."
+            f"{email_hint}",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        info = test_connection()
+        sheets_list = ", ".join(info.get("sheet_names") or [])
+        sa_email = info.get("service_account_email") or "—"
+        url = info.get("url") or "—"
+        await update.message.reply_text(
+            "✅ Подключение к Google Таблице работает.\n\n"
+            f"Таблица: {info.get('spreadsheet_title')}\n"
+            f"Листы: {sheets_list}\n"
+            f"Сотрудники: {', '.join(info.get('employees') or [])}\n"
+            f"Сервисный аккаунт: {sa_email}\n"
+            f"Ссылка: {url}"
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не удалось подключиться к Google Таблице:\n{e}\n\n"
+            "Проверьте ID таблицы, имя листа и доступ сервисного аккаунта."
+        )
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик загрузки документа (Excel файла)"""
     document = update.message.document
@@ -283,8 +432,39 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             report_date = extract_date_from_filename(filename)
             if not report_date:
                 report_date = datetime.now().strftime('%d.%m.%Y')
-            report = format_report(data, report_date)
-            await update.message.reply_text(f"✅ Готово!\n\n{report}")
+
+            if not is_configured():
+                await update.message.reply_text(
+                    f"✅ Файл за {report_date} обработан.\n\n"
+                    f"Выручка: {_format_money(data['revenue'])} руб.\n"
+                    f"Чеков: {data['receipt_count']}\n\n"
+                    "⚠️ Google Таблица не настроена — данные пока никуда не записаны.\n"
+                    "Настройте подключение и проверьте командой /sheets."
+                )
+                return
+
+            employee_key = context.user_data.get("employee")
+            if employee_key in EMPLOYEES:
+                result = write_report(data, report_date, employee_key)
+                await _send_report_result(
+                    update,
+                    data=data,
+                    report_date=report_date,
+                    result=result,
+                )
+                return
+
+            context.user_data["pending_report"] = {
+                "data": data,
+                "report_date": report_date,
+            }
+            await update.message.reply_text(
+                f"✅ Файл за {report_date} обработан.\n\n"
+                f"Выручка: {_format_money(data['revenue'])} руб.\n"
+                f"Чеков: {data['receipt_count']}\n\n"
+                "Кому делаем отчёт?",
+                reply_markup=EMPLOYEE_KEYBOARD,
+            )
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -292,8 +472,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         await update.message.reply_text(
             f"❌ Ошибка при обработке файла:\n{str(e)}\n\n"
-            "Убедитесь, что файл — это экспорт чеков с корректной структурой "
-            "(столбцы I — тип операции, O — список позиций)."
+            "Проверьте структуру Excel (столбцы I/O) и настройки Google Таблицы "
+            "(доступ сервисного аккаунта, имя листа месяца)."
         )
         raise
 
@@ -320,6 +500,9 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("sheets", cmd_sheets))
+    app.add_handler(CallbackQueryHandler(ui_pick_employee, pattern=r"^ui:pick_employee$"))
+    app.add_handler(CallbackQueryHandler(ui_select_employee, pattern=r"^emp:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     conv = ConversationHandler(
         entry_points=[
@@ -354,8 +537,19 @@ def main() -> None:
     except Exception as e:
         print("WARNING: failed to load rules at startup:", e)
 
-    print("Бот запущен. Отправьте файл Excel для формирования отчёта.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if is_configured():
+        print("Google Sheets: configured")
+        try:
+            info = test_connection()
+            print(f"Google Sheets: OK — {info.get('spreadsheet_title')} / {', '.join(info.get('sheet_names') or [])}")
+        except Exception as e:
+            print("Google Sheets: connection failed:", e)
+    else:
+        print("Google Sheets: not configured (set GOOGLE_SPREADSHEET_ID + service account)")
+
+    print("Бот запущен. Отправьте файл Excel — данные будут записаны в Google Таблицу.")
+    # Не выходим при кратковременных сетевых сбоях Telegram API.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
