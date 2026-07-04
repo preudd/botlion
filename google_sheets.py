@@ -62,6 +62,73 @@ EMPLOYEES: dict[str, dict[str, Any]] = {
 # W/X..AI, AN/AO..AZ, BF/BG..BR — 12 полей из Excel, без кассовых колонок
 VALUES_COUNT = 12
 
+DEFAULT_SA_FILENAME = "service_account.json"
+
+
+def _service_account_file_path() -> str:
+    explicit = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE")
+    if explicit:
+        return explicit
+    data_dir = os.environ.get("DATA_DIR", "/app/data").strip() or "/app/data"
+    return os.path.join(data_dir, DEFAULT_SA_FILENAME)
+
+
+def _get_b64_from_env() -> str:
+    single = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+    if single:
+        return single
+    parts: list[str] = []
+    for index in range(1, 10):
+        part = os.environ.get(f"GOOGLE_SERVICE_ACCOUNT_JSON_B64_{index}", "").strip()
+        if not part:
+            break
+        parts.append(part)
+    return "".join(parts)
+
+
+def bootstrap_service_account_file() -> str | None:
+    """Сохраняет JSON из env в файл на диске — надёжнее для хостинга."""
+    path = _service_account_file_path()
+    if os.path.isfile(path):
+        return path
+
+    json_raw = ""
+    b64 = _get_b64_from_env()
+    if b64:
+        json_raw = _decode_b64_env(b64)
+    if not json_raw:
+        json_raw = _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not json_raw:
+        return None
+
+    info = _parse_service_account_info(json_raw)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(info, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return path
+
+
+def get_credentials_diagnostics() -> dict[str, str]:
+    """Диагностика credentials для логов (без секретов)."""
+    path = _service_account_file_path()
+    b64 = _get_b64_from_env()
+    diag = {
+        "file_path": path,
+        "file_exists": "yes" if os.path.isfile(path) else "no",
+        "b64_len": str(len(re.sub(r"\s+", "", b64.strip().strip('"').strip("'")))) if b64 else "0",
+    }
+    try:
+        json_raw = _load_service_account_json_raw()
+        info = _parse_service_account_info(json_raw)
+        diag["client_email"] = str(info.get("client_email") or "?")
+        diag["private_key_id"] = str(info.get("private_key_id") or "?")
+        diag["private_key_len"] = str(len(info.get("private_key") or ""))
+    except Exception as exc:
+        diag["parse_error"] = str(exc)[:160]
+    return diag
+
 
 def _load_setting(name: str, default: str = "") -> str:
     val = os.environ.get(name, "").strip()
@@ -77,10 +144,44 @@ def _load_setting(name: str, default: str = "") -> str:
 
 def _normalize_private_key(value: str) -> str:
     """Исправляет private_key после копирования JSON в переменные хостинга."""
-    pk = value.strip().strip('"').replace("\r\n", "\n").replace("\r", "\n")
-    if "\\n" in pk:
-        pk = pk.replace("\\n", "\n")
+    pk = value.strip().strip('"').strip("'")
+    pk = pk.replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    if "BEGIN PRIVATE KEY" not in pk:
+        return pk
+
+    lines: list[str] = []
+    for line in pk.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("-----"):
+            lines.append(line)
+        else:
+            lines.append(re.sub(r"\s+", "", line))
+    pk = "\n".join(lines)
+    if not pk.endswith("\n"):
+        pk += "\n"
     return pk
+
+
+def _decode_b64_env(value: str) -> str:
+    """Декодирует base64 из переменной окружения (убирает пробелы и кавычки)."""
+    b64 = value.strip().strip('"').strip("'")
+    b64 = re.sub(r"\s+", "", b64)
+    if not b64:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_B64 пустой.")
+    try:
+        return base64.b64decode(b64, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        pass
+    pad = (-len(b64)) % 4
+    try:
+        return base64.b64decode(b64 + ("=" * pad)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON_B64: невалидный base64. "
+            "Сгенерируйте заново: python make_b64.py service_account.json"
+        ) from exc
 
 
 def _parse_service_account_info(json_raw: str) -> dict:
@@ -112,12 +213,14 @@ def _parse_service_account_info(json_raw: str) -> dict:
 
 def _load_service_account_json_raw() -> str:
     """JSON сервисного аккаунта из env (обычный или base64) или config."""
-    b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+    path = _service_account_file_path()
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    b64 = _get_b64_from_env()
     if b64:
-        try:
-            return base64.b64decode(b64).decode("utf-8")
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_B64: невалидный base64") from exc
+        return _decode_b64_env(b64)
 
     return _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -131,14 +234,17 @@ def get_config_status() -> dict[str, str]:
             json_raw = _load_service_account_json_raw()
         except RuntimeError:
             json_raw = ""
-    file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    file_path = _service_account_file_path()
     file_exists = bool(file_path and os.path.isfile(file_path))
 
-    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip():
+    b64 = _get_b64_from_env()
+    if file_exists:
+        sa_source = "file"
+    elif b64:
         sa_source = "env_b64"
     elif json_raw:
         sa_source = "env_json"
-    elif file_exists:
+    elif file_path and os.path.isfile(_load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")):
         sa_source = "file"
     else:
         sa_source = "missing"
@@ -162,7 +268,7 @@ def is_configured() -> bool:
             return True
     except RuntimeError:
         return False
-    file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    file_path = _service_account_file_path()
     return bool(file_path and os.path.isfile(file_path))
 
 
@@ -172,6 +278,14 @@ def _load_credentials():
             "Не установлены библиотеки для Google Sheets. Выполните: pip install -r requirements.txt"
         )
 
+    try:
+        bootstrap_service_account_file()
+    except RuntimeError as exc:
+        print("WARNING: failed to bootstrap service account file:", exc)
+    file_path = _service_account_file_path()
+    if file_path and os.path.isfile(file_path):
+        return Credentials.from_service_account_file(file_path, scopes=SCOPES)
+
     json_raw = _load_service_account_json_raw()
     if json_raw:
         info = _parse_service_account_info(json_raw)
@@ -180,10 +294,14 @@ def _load_credentials():
         except Exception as exc:
             msg = str(exc)
             if "invalid" in msg.lower() and "key" in msg.lower():
-                raise RuntimeError(
-                    "Invalid private key: проверьте GOOGLE_SERVICE_ACCOUNT_JSON_B64. "
-                    "Удалите GOOGLE_SERVICE_ACCOUNT_JSON, если заданы обе переменные."
-                ) from exc
+                email = info.get("client_email", "?")
+                pk = info.get("private_key", "")
+                hint = (
+                    f"Invalid private key (аккаунт {email}, длина ключа {len(pk)}). "
+                    "Загрузите service_account.json в /app/data/ на хостинге "
+                    "или разбейте B64 на GOOGLE_SERVICE_ACCOUNT_JSON_B64_1 и _2."
+                )
+                raise RuntimeError(hint) from exc
             raise
 
     file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")

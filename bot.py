@@ -26,6 +26,7 @@ from rules_manager import UI_CATEGORIES, add_keyword, load_rules, remove_keyword
 from google_sheets import (
     EMPLOYEES,
     get_config_status,
+    get_credentials_diagnostics,
     get_employee_label,
     is_configured,
     test_connection,
@@ -34,7 +35,7 @@ from google_sheets import (
 )
 
 STATE_PICK_CATEGORY, STATE_WAIT_KEYWORD, STATE_PICK_DELETE_CATEGORY, STATE_PICK_DELETE_KEYWORD = range(4)
-APP_BUILD = "google-sheets-employees-v2"
+APP_BUILD = "google-sheets-employees-v3"
 
 
 async def _on_startup(application: Application) -> None:
@@ -554,6 +555,18 @@ def main() -> None:
         f"gspread={cfg['gspread']},",
         f"configured={cfg['configured']}",
     )
+    diag = get_credentials_diagnostics()
+    print(
+        "Google Sheets credentials:",
+        f"file={diag.get('file_path')},",
+        f"exists={diag.get('file_exists')},",
+        f"b64_len={diag.get('b64_len')},",
+        f"email={diag.get('client_email', '?')},",
+        f"key_id={diag.get('private_key_id', '?')},",
+        f"key_len={diag.get('private_key_len', '?')}",
+    )
+    if diag.get("parse_error"):
+        print("Google Sheets parse error:", diag["parse_error"])
 
     if is_configured():
         try:

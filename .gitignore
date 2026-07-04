@@ -3,6 +3,10 @@ config.py
 category_rules.json
 service_account.json
 *-service-account*.json
+botlion-501208-*.json
+b64_for_host.txt
+b64_part1.txt
+json_for_host.txt
 
 # Python
 __pycache__/
