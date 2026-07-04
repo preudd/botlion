@@ -25,6 +25,7 @@ from report_parser import parse_excel_report
 from rules_manager import UI_CATEGORIES, add_keyword, load_rules, remove_keyword
 from google_sheets import (
     EMPLOYEES,
+    get_config_status,
     get_employee_label,
     is_configured,
     test_connection,
@@ -537,15 +538,29 @@ def main() -> None:
     except Exception as e:
         print("WARNING: failed to load rules at startup:", e)
 
+    token_status = "set" if BOT_TOKEN and BOT_TOKEN != "YOUR_BOT_TOKEN_HERE" else "MISSING"
+    print(f"BOT_TOKEN: {token_status}")
+
+    cfg = get_config_status()
+    print(
+        "Google Sheets config:",
+        f"spreadsheet_id={cfg['spreadsheet_id']},",
+        f"service_account={cfg['service_account']},",
+        f"gspread={cfg['gspread']},",
+        f"configured={cfg['configured']}",
+    )
+
     if is_configured():
-        print("Google Sheets: configured")
         try:
             info = test_connection()
             print(f"Google Sheets: OK — {info.get('spreadsheet_title')} / {', '.join(info.get('sheet_names') or [])}")
         except Exception as e:
             print("Google Sheets: connection failed:", e)
     else:
-        print("Google Sheets: not configured (set GOOGLE_SPREADSHEET_ID + service account)")
+        print(
+            "Google Sheets: not configured. Set GOOGLE_SPREADSHEET_ID and "
+            "GOOGLE_SERVICE_ACCOUNT_JSON (or GOOGLE_SERVICE_ACCOUNT_JSON_B64)."
+        )
 
     print("Бот запущен. Отправьте файл Excel — данные будут записаны в Google Таблицу.")
     # Не выходим при кратковременных сетевых сбоях Telegram API.

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -74,12 +75,56 @@ def _load_setting(name: str, default: str = "") -> str:
         return default
 
 
+def _load_service_account_json_raw() -> str:
+    """JSON сервисного аккаунта из env (обычный или base64) или config."""
+    b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
+    if b64:
+        try:
+            return base64.b64decode(b64).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_B64: невалидный base64") from exc
+
+    return _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+
+def get_config_status() -> dict[str, str]:
+    """Статус настроек для логов при старте (без секретов)."""
+    spreadsheet_id = _load_setting("GOOGLE_SPREADSHEET_ID")
+    json_raw = ""
+    if spreadsheet_id:
+        try:
+            json_raw = _load_service_account_json_raw()
+        except RuntimeError:
+            json_raw = ""
+    file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    file_exists = bool(file_path and os.path.isfile(file_path))
+
+    if json_raw:
+        sa_source = "env_json"
+    elif file_exists:
+        sa_source = "file"
+    else:
+        sa_source = "missing"
+
+    gspread_ok = "yes" if gspread is not None else "no"
+
+    return {
+        "spreadsheet_id": "set" if spreadsheet_id else "MISSING",
+        "service_account": sa_source,
+        "gspread": gspread_ok,
+        "configured": "yes" if is_configured() else "no",
+    }
+
+
 def is_configured() -> bool:
     spreadsheet_id = _load_setting("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id:
         return False
-    if _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON"):
-        return True
+    try:
+        if _load_service_account_json_raw():
+            return True
+    except RuntimeError:
+        return False
     file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
     return bool(file_path and os.path.isfile(file_path))
 
@@ -90,9 +135,15 @@ def _load_credentials():
             "Не установлены библиотеки для Google Sheets. Выполните: pip install -r requirements.txt"
         )
 
-    json_raw = _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
+    json_raw = _load_service_account_json_raw()
     if json_raw:
-        info = json.loads(json_raw)
+        try:
+            info = json.loads(json_raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON содержит невалидный JSON. "
+                "На хостинге попробуйте GOOGLE_SERVICE_ACCOUNT_JSON_B64."
+            ) from exc
         return Credentials.from_service_account_info(info, scopes=SCOPES)
 
     file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
@@ -105,7 +156,7 @@ def _load_credentials():
 
 
 def get_service_account_email() -> str | None:
-    json_raw = _load_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
+    json_raw = _load_service_account_json_raw()
     if json_raw:
         try:
             return json.loads(json_raw).get("client_email")
