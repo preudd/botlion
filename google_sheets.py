@@ -75,6 +75,41 @@ def _load_setting(name: str, default: str = "") -> str:
         return default
 
 
+def _normalize_private_key(value: str) -> str:
+    """Исправляет private_key после копирования JSON в переменные хостинга."""
+    pk = value.strip().strip('"').replace("\r\n", "\n").replace("\r", "\n")
+    if "\\n" in pk:
+        pk = pk.replace("\\n", "\n")
+    return pk
+
+
+def _parse_service_account_info(json_raw: str) -> dict:
+    raw = json_raw.strip()
+    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"') and "{" not in raw):
+        raw = raw[1:-1].strip()
+
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON содержит невалидный JSON. "
+            "На хостинге используйте GOOGLE_SERVICE_ACCOUNT_JSON_B64."
+        ) from exc
+
+    pk = info.get("private_key")
+    if not isinstance(pk, str) or not pk.strip():
+        raise RuntimeError("В JSON сервисного аккаунта отсутствует private_key.")
+
+    info = dict(info)
+    info["private_key"] = _normalize_private_key(pk)
+    if "BEGIN PRIVATE KEY" not in info["private_key"]:
+        raise RuntimeError(
+            "private_key повреждён или обрезан. "
+            "Удалите GOOGLE_SERVICE_ACCOUNT_JSON и задайте только GOOGLE_SERVICE_ACCOUNT_JSON_B64."
+        )
+    return info
+
+
 def _load_service_account_json_raw() -> str:
     """JSON сервисного аккаунта из env (обычный или base64) или config."""
     b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip()
@@ -99,7 +134,9 @@ def get_config_status() -> dict[str, str]:
     file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
     file_exists = bool(file_path and os.path.isfile(file_path))
 
-    if json_raw:
+    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64", "").strip():
+        sa_source = "env_b64"
+    elif json_raw:
         sa_source = "env_json"
     elif file_exists:
         sa_source = "file"
@@ -137,14 +174,17 @@ def _load_credentials():
 
     json_raw = _load_service_account_json_raw()
     if json_raw:
+        info = _parse_service_account_info(json_raw)
         try:
-            info = json.loads(json_raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON содержит невалидный JSON. "
-                "На хостинге попробуйте GOOGLE_SERVICE_ACCOUNT_JSON_B64."
-            ) from exc
-        return Credentials.from_service_account_info(info, scopes=SCOPES)
+            return Credentials.from_service_account_info(info, scopes=SCOPES)
+        except Exception as exc:
+            msg = str(exc)
+            if "invalid" in msg.lower() and "key" in msg.lower():
+                raise RuntimeError(
+                    "Invalid private key: проверьте GOOGLE_SERVICE_ACCOUNT_JSON_B64. "
+                    "Удалите GOOGLE_SERVICE_ACCOUNT_JSON, если заданы обе переменные."
+                ) from exc
+            raise
 
     file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
     if not file_path or not os.path.isfile(file_path):
@@ -159,8 +199,8 @@ def get_service_account_email() -> str | None:
     json_raw = _load_service_account_json_raw()
     if json_raw:
         try:
-            return json.loads(json_raw).get("client_email")
-        except json.JSONDecodeError:
+            return _parse_service_account_info(json_raw).get("client_email")
+        except (json.JSONDecodeError, RuntimeError):
             return None
 
     file_path = _load_setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")

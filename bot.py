@@ -34,7 +34,12 @@ from google_sheets import (
 )
 
 STATE_PICK_CATEGORY, STATE_WAIT_KEYWORD, STATE_PICK_DELETE_CATEGORY, STATE_PICK_DELETE_KEYWORD = range(4)
-APP_BUILD = "google-sheets-employees-v1"
+APP_BUILD = "google-sheets-employees-v2"
+
+
+async def _on_startup(application: Application) -> None:
+    me = await application.bot.get_me()
+    print(f"Telegram bot online: @{me.username} (id={me.id})")
 
 EMPLOYEE_KEYBOARD = InlineKeyboardMarkup(
     [
@@ -499,7 +504,7 @@ def main() -> None:
         print("=" * 50)
         sys.exit(1)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("sheets", cmd_sheets))
     app.add_handler(CallbackQueryHandler(ui_pick_employee, pattern=r"^ui:pick_employee$"))
@@ -564,7 +569,11 @@ def main() -> None:
 
     print("Бот запущен. Отправьте файл Excel — данные будут записаны в Google Таблицу.")
     # Не выходим при кратковременных сетевых сбоях Telegram API.
-    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=-1,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
